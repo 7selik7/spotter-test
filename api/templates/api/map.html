@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fuel Route Map</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 14px/1.4 system-ui, sans-serif; display: flex; height: 100vh; }
+    #panel { width: 460px; padding: 16px; overflow-y: auto; border-right: 1px solid #ddd; }
+    #map { flex: 1; }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    h2 { font-size: 14px; margin: 18px 0 6px; }
+    .hint { color: #666; font-size: 12px; margin: 0 0 12px; }
+    label { display: block; font-weight: 600; margin: 10px 0 4px; }
+    input { width: 100%; padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; }
+    .row { display: flex; gap: 8px; }
+    .row > div { flex: 1; }
+    button { margin-top: 14px; width: 100%; padding: 8px; border: 0; border-radius: 4px;
+             background: #1f6feb; color: #fff; font-weight: 600; cursor: pointer; }
+    button:disabled { background: #8aa; cursor: wait; }
+    #error { color: #b00; margin-top: 10px; white-space: pre-wrap; }
+    .totals { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 14px; }
+    .totals div { background: #f3f5f8; padding: 6px 8px; border-radius: 4px; }
+    .totals b { display: block; font-size: 16px; }
+    .totals .good { background: #e7f6ec; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 3px 4px; border-bottom: 1px solid #eee; vertical-align: top; }
+    th { position: sticky; top: 0; background: #fff; }
+    td.num, th.num { text-align: right; white-space: nowrap; }
+    tr.chosen td { font-weight: 600; background: #eef4ff; }
+    tr.st-stop td { background: #eef4ff; font-weight: 600; }
+    tr.st-thinned td { color: #999; }
+    tr.clickable { cursor: pointer; }
+    tr.clickable:hover td { background: #fff7d6; }
+    .scroll { max-height: 340px; overflow-y: auto; border: 1px solid #eee; }
+    .meta, .note { color: #666; font-size: 12px; margin-top: 6px; }
+    .legend span { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin: 0 3px 0 8px; }
+    .badge { font-size: 11px; padding: 0 4px; border-radius: 3px; background: #eee; }
+    .pick-icon { color: #fff; border-radius: 50% 50% 50% 0; transform: rotate(-45deg); width: 28px; height: 28px;
+                 display: flex; align-items: center; justify-content: center; border: 2px solid #fff;
+                 box-shadow: 0 0 4px rgba(0,0,0,.6); }
+    .pick-icon b { transform: rotate(45deg); font-size: 14px; }
+    .pick-start { background: #1a9e3f; }
+    .pick-finish { background: #d1342f; }
+    .next { display: inline-block; padding: 1px 6px; border-radius: 3px; color: #fff; font-weight: 600; }
+    .stop-icon { background: #1f6feb; color: #fff; border-radius: 50%; width: 24px; height: 24px;
+                 display: flex; align-items: center; justify-content: center; font-weight: 700;
+                 border: 2px solid #fff; box-shadow: 0 0 3px #000; }
+    @media (max-width: 760px) {
+      body { flex-direction: column; height: auto; }
+      #panel { width: 100%; border-right: 0; }
+      #map { height: 60vh; flex: none; }
+    }
+  </style>
+</head>
+<body>
+<div id="panel">
+  <h1>Fuel Route</h1>
+  <p class="hint">Click the map to set start, then finish; drag a pin to move it
+    (or type an address: <i>street, city, ST zip</i>, or <i>lat, lon</i>).<br>
+    Next click sets: <span id="next" class="next"></span></p>
+
+  <label for="start"><span class="next" style="background:#1a9e3f">A</span> Start</label>
+  <input id="start" value="233 S Wacker Dr, Chicago, IL 60606">
+  <label for="finish"><span class="next" style="background:#d1342f">B</span> Finish</label>
+  <input id="finish" value="34.0516, -118.2456">
+
+  <div class="row">
+    <div><label for="fuel">Start fuel, gal</label><input id="fuel" type="number" min="0" max="50" value="0"></div>
+    <div><label for="penalty">Stop penalty, $</label><input id="penalty" type="number" min="0" value="25"></div>
+  </div>
+  <button id="go">Plan route</button>
+  <div id="error"></div>
+  <div id="summary"></div>
+</div>
+<div id="map"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const API_URL = "{% url 'route' %}";
+const map = L.map("map").setView([39.5, -98.35], 4);
+// OSM tile servers reject requests without a Referer (tile usage policy)
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19, referrerPolicy: "strict-origin-when-cross-origin",
+  attribution: "&copy; OpenStreetMap contributors",
+}).addTo(map);
+const layer = L.layerGroup().addTo(map);
+const $ = (id) => document.getElementById(id);
+let stationMarkers = {};  // opis_id -> marker, to jump from the table to the map
+
+// ---- start / finish pins: set by a click, draggable, synced with the inputs
+const pins = {};
+const fmt = (ll) => `${ll.lat.toFixed(5)}, ${ll.lng.toFixed(5)}`;
+function pinIcon(which) {
+  return L.divIcon({ className: "", iconSize: [28, 28], iconAnchor: [14, 28], popupAnchor: [0, -28],
+    html: `<div class="pick-icon pick-${which}"><b>${which === "start" ? "A" : "B"}</b></div>` });
+}
+function setPin(which, latlng, label) {
+  if (!pins[which]) {
+    pins[which] = L.marker(latlng, { icon: pinIcon(which), draggable: true, zIndexOffset: 2000 }).addTo(map);
+    pins[which].on("dragend", () => { $(which).value = fmt(pins[which].getLatLng()); });
+  } else {
+    pins[which].setLatLng(latlng);
+  }
+  pins[which].bindPopup(`<b>${which === "start" ? "Start" : "Finish"}</b><br>${esc(label || fmt(L.latLng(latlng)))}`);
+}
+
+let nextPoint = "start";
+function showNext() {
+  $("next").textContent = nextPoint === "start" ? "A  Start" : "B  Finish";
+  $("next").style.background = nextPoint === "start" ? "#1a9e3f" : "#d1342f";
+}
+map.on("click", (e) => {
+  $(nextPoint).value = fmt(e.latlng);
+  setPin(nextPoint, e.latlng);
+  nextPoint = nextPoint === "start" ? "finish" : "start";
+  showNext();
+});
+
+// typed "lat, lon" -> move the pin right away (addresses get their pin after geocoding)
+for (const which of ["start", "finish"]) {
+  $(which).addEventListener("change", () => {
+    try {
+      const p = parsePoint($(which).value);
+      if ("lat" in p) setPin(which, [p.lat, p.lon]);
+    } catch (e) { /* shown on submit */ }
+  });
+}
+
+// "lat, lon" -> coordinates; "street, city, ST 12345" -> address
+function parsePoint(text) {
+  const t = text.trim();
+  const coords = t.match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
+  if (coords) return { lat: +coords[1], lon: +coords[2] };
+  const parts = t.split(",").map((p) => p.trim()).filter(Boolean);
+  if (parts.length < 3) throw new Error(`"${t}": use "street, city, ST zip" or "lat, lon"`);
+  const m = parts[parts.length - 1].match(/^([A-Za-z]{2})\s*(\d{5})?$/);
+  if (!m) throw new Error(`"${t}": the last part must be a state code, e.g. "IL 60606"`);
+  return { street: parts.slice(0, -2).join(", "), city: parts[parts.length - 2],
+           state: m[1].toUpperCase(), ...(m[2] ? { zip: m[2] } : {}) };
+}
+
+// Google encoded polyline, precision 6 (OSRM polyline6)
+function decodePolyline(str, precision = 6) {
+  const factor = 10 ** precision, coords = [];
+  let index = 0, lat = 0, lng = 0;
+  while (index < str.length) {
+    for (const axis of [0, 1]) {
+      let shift = 0, result = 0, byte;
+      do { byte = str.charCodeAt(index++) - 63; result |= (byte & 0x1f) << shift; shift += 5; } while (byte >= 0x20);
+      const delta = result & 1 ? ~(result >> 1) : result >> 1;
+      if (axis === 0) lat += delta; else lng += delta;
+    }
+    coords.push([lat / factor, lng / factor]);
+  }
+  return coords;
+}
+
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const money = (v) => v == null ? "—" : `$${Number(v).toFixed(2)}`;
+
+// green (cheap) -> red (expensive) within the corridor's price range
+function priceColor(p, min, max) {
+  const t = max > min ? Math.min(Math.max((p - min) / (max - min), 0), 1) : 0;
+  return `hsl(${Math.round(120 * (1 - t))}, 75%, 42%)`;
+}
+
+$("go").addEventListener("click", async () => {
+  $("error").textContent = "";
+  let body;
+  try {
+    body = {
+      start: parsePoint($("start").value),
+      finish: parsePoint($("finish").value),
+      start_fuel_gallons: +$("fuel").value || 0,
+      stop_penalty_usd: +$("penalty").value || 0,
+      explain: true,
+    };
+  } catch (e) { $("error").textContent = e.message; return; }
+
+  $("go").disabled = true; $("go").textContent = "Planning...";
+  try {
+    const resp = await fetch(API_URL, { method: "POST", headers: { "Content-Type": "application/json" },
+                                        body: JSON.stringify(body) });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || JSON.stringify(data));
+    render(data);
+  } catch (e) {
+    $("error").textContent = e.message;
+  } finally {
+    $("go").disabled = false; $("go").textContent = "Plan route";
+  }
+});
+
+function render(d) {
+  layer.clearLayers();
+  stationMarkers = {};
+  const sm = d.summary, cmp = sm.comparison, m = d.meta;
+  const stations = d.corridor_stations || [];
+  // colour scale on the 5th..95th percentile, so one $4.58 outlier doesn't paint everything green
+  const prices = stations.map((s) => s.price_per_gallon).sort((a, b) => a - b);
+  const pct = (q) => prices.length ? prices[Math.min(prices.length - 1, Math.floor(q * prices.length))] : 0;
+  const pMin = pct(0.05), pMax = pct(0.95);
+
+  // other OSRM alternatives: grey dashed, below everything
+  for (const a of d.alternatives || []) {
+    if (a.chosen) continue;
+    L.polyline(decodePolyline(a.geometry), { color: "#777", weight: 4, opacity: 0.6, dashArray: "8 8" })
+      .addTo(layer)
+      .bindPopup(`<b>Alternative ${a.index + 1}</b> (not chosen)<br>${a.distance_miles} mi, ` +
+                 (a.error ? esc(a.error) : `${a.stops_count} stops, fuel ${money(a.total_fuel_cost)}, ` +
+                  `objective ${money(a.objective)}`));
+  }
+
+  const line = L.polyline(decodePolyline(d.route.geometry), { color: "#1f6feb", weight: 4, opacity: 0.7 }).addTo(layer);
+  map.fitBounds(line.getBounds(), { padding: [30, 30] });
+
+  // every station in the corridor, coloured by price
+  for (const s of stations) {
+    if (s.status === "stop") continue;
+    const mk = L.circleMarker([s.lat, s.lon], {
+      radius: s.status === "considered" ? 4 : 2.5, weight: 1, color: "#333",
+      fillColor: priceColor(s.price_per_gallon, pMin, pMax), fillOpacity: s.status === "considered" ? 0.9 : 0.5,
+    }).addTo(layer).bindPopup(
+      `<b>${esc(s.name)}</b><br>${esc(s.address)}, ${esc(s.city)}, ${esc(s.state)}<br>` +
+      `mile ${s.mile_marker} &middot; <b>$${s.price_per_gallon.toFixed(3)}</b>/gal &middot; ${s.detour_miles} mi off route<br>` +
+      `<small>${s.status === "considered" ? "considered by the optimizer, not chosen" : "thinned out: a cheaper station nearby was kept"}</small>`);
+    stationMarkers[s.opis_id] = mk;
+  }
+
+  line.bringToFront();  // the route stays visible above dense station dots
+
+  // pins move to where the API resolved the points (geocoded address / snapped coordinates)
+  setPin("start", [d.route.start.lat, d.route.start.lon], d.route.start.matched_address || d.route.start.query);
+  setPin("finish", [d.route.finish.lat, d.route.finish.lon], d.route.finish.matched_address || d.route.finish.query);
+
+  for (const s of d.fuel_stops) {
+    const icon = L.divIcon({ className: "", html: `<div class="stop-icon">${s.order}</div>`, iconSize: [24, 24] });
+    stationMarkers[s.opis_id] = L.marker([s.lat, s.lon], { icon, zIndexOffset: 1000 }).addTo(layer).bindPopup(
+      `<b>${s.order}. ${esc(s.name)}</b><br>${esc(s.address)}, ${esc(s.city)}, ${esc(s.state)}<br>` +
+      `mile ${s.mile_marker} &middot; $${s.price_per_gallon}/gal<br>` +
+      `arrive with ${s.fuel_on_arrival_gallons} gal &middot; buy <b>${s.gallons} gal</b> = <b>${money(s.cost)}</b>` +
+      `<br><small>location: ${s.geo_precision === "exit" ? "highway exit" : "city center (approx.)"}</small>`);
+  }
+
+  // ---- panel
+  const stopRows = d.fuel_stops.map((s) => `<tr class="clickable" data-id="${s.opis_id}"><td>${s.order}</td>
+      <td>${esc(s.name)}<br><small>${esc(s.city)}, ${esc(s.state)}</small></td>
+      <td class="num">${s.mile_marker}</td><td class="num">${s.price_per_gallon.toFixed(3)}</td>
+      <td class="num">${s.fuel_on_arrival_gallons}</td><td class="num">${s.gallons}</td>
+      <td class="num">${money(s.cost)}</td></tr>`).join("");
+
+  const altRows = (d.alternatives || []).map((a) => `<tr class="${a.chosen ? "chosen" : ""}">
+      <td>${a.index + 1}${a.chosen ? " ✓" : ""}</td><td class="num">${a.distance_miles}</td>
+      <td class="num">${a.stops_count ?? "—"}</td><td class="num">${money(a.total_fuel_cost)}</td>
+      <td class="num">${money(a.objective)}</td><td>${a.error ? esc(a.error) : a.chosen ? "chosen" : "line ‒ ‒"}</td></tr>`).join("");
+
+  const counts = stations.reduce((acc, s) => (acc[s.status] = (acc[s.status] || 0) + 1, acc), {});
+  const stRows = stations.map((s) => `<tr class="st-${s.status} clickable" data-id="${s.opis_id}">
+      <td class="num">${s.mile_marker}</td>
+      <td>${esc(s.name)}<br><small>${esc(s.address)}, ${esc(s.city)}, ${esc(s.state)}</small></td>
+      <td class="num" style="color:${priceColor(s.price_per_gallon, pMin, pMax)}">${s.price_per_gallon.toFixed(3)}</td>
+      <td class="num">${s.detour_miles}</td><td><span class="badge">${s.status}</span></td></tr>`).join("");
+
+  $("summary").innerHTML = `
+    ${m.final_route_refined || !d.fuel_stops.length ? "" : `<div id="warn" style="margin-top:12px;padding:8px;
+      border-radius:4px;background:#fff4e5;color:#8a4b00">Could not re-route through the stops (the real road
+      through them breaks the 500 mi range). The line is the original route; stops are from the corridor plan.</div>`}
+    <div class="totals">
+      <div>Distance<b>${d.route.distance_miles} mi</b></div>
+      <div>Fuel cost<b>${money(sm.total_fuel_cost)}</b></div>
+      <div>Fuel bought<b>${sm.total_gallons} gal</b></div>
+      <div>Stops<b>${sm.stops_count}</b></div>
+      ${cmp ? `<div>Avg price on the way<b>$${cmp.corridor_avg_price.toFixed(3)}</b></div>
+      <div>We pay on average<b>$${(sm.average_price_paid ?? 0).toFixed(3)}</b></div>
+      <div>Same fuel at avg price<b>${money(cmp.cost_at_avg_price)}</b></div>
+      <div class="good">Saved vs avg<b>${money(cmp.savings_vs_avg)}</b></div>` : ""}
+    </div>
+
+    <h2>Fuel stops</h2>
+    ${d.fuel_stops.length ? `<table><tr><th>#</th><th>Where</th><th class="num">Mile</th><th class="num">$/gal</th>
+      <th class="num">Arrive</th><th class="num">Buy</th><th class="num">Cost</th></tr>${stopRows}</table>`
+      : "<p>No fuel stops needed.</p>"}
+
+    <h2>Routes compared</h2>
+    <table><tr><th>#</th><th class="num">Miles</th><th class="num">Stops</th><th class="num">Fuel</th>
+      <th class="num">Objective</th><th></th></tr>${altRows}</table>
+    <div class="note">Objective = fuel cost + $${m.stop_penalty_usd} per stop; the lowest wins.
+      Numbers are the corridor estimate the choice was made on; the chosen route is then re-routed through
+      its stops (fuel ${money((d.alternatives || []).find((a) => a.chosen)?.final_total_fuel_cost)}).</div>
+
+    <h2>Stations along the route (${stations.length})</h2>
+    <div class="legend note">price:<span style="background:${priceColor(pMin, pMin, pMax)}"></span>≤ $${pMin.toFixed(2)}
+      <span style="background:${priceColor(pMax, pMin, pMax)}"></span>≥ $${pMax.toFixed(2)}
+      &nbsp;· stop ${counts.stop || 0} · considered ${counts.considered || 0} · thinned ${counts.thinned || 0}</div>
+    <div class="scroll"><table><tr><th class="num">Mile</th><th>Station</th><th class="num">$/gal</th>
+      <th class="num">Off&nbsp;route</th><th>Status</th></tr>${stRows}</table></div>
+    <div class="note">thinned = a cheaper station within the same 20 miles was kept; click a row to see it on the map.</div>
+
+    <div class="meta">${m.external_calls} external calls (${m.external_calls_detail.join(", ")}),
+      compute ${m.compute_ms} ms, total ${m.total_ms} ms</div>`;
+
+  for (const tr of $("summary").querySelectorAll("tr.clickable")) {
+    tr.addEventListener("click", () => {
+      const mk = stationMarkers[tr.dataset.id];
+      if (mk) { map.setView(mk.getLatLng(), Math.max(map.getZoom(), 9)); mk.openPopup(); }
+    });
+  }
+}
+
+showNext();
+for (const which of ["start", "finish"]) $(which).dispatchEvent(new Event("change"));
+</script>
+</body>
+</html>

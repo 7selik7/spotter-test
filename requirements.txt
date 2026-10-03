@@ -1,0 +1,7 @@
+Django==6.1.1
+djangorestframework==3.18.1
+drf-spectacular==0.30.0
+psycopg[binary]==3.3.6
+httpx==0.28.1
+polyline==2.0.4
+gunicorn==26.2.0
